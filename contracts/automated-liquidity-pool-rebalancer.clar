@@ -6,6 +6,8 @@
 (define-constant ERR-SLIPPAGE-TOO-HIGH (err u104))
 (define-constant ERR-ALREADY-EXISTS (err u105))
 (define-constant ERR-ZERO-AMOUNT (err u106))
+(define-constant ERR-NO-REWARDS (err u107))
+(define-constant ERR-REWARDS-NOT-ACTIVE (err u108))
 
 (define-data-var next-pool-id uint u0)
 (define-data-var total-pools uint u0)
@@ -45,6 +47,29 @@
 )
 
 (define-data-var total-protocol-fees uint u0)
+(define-data-var reward-token principal .automated-liquidity-pool-rebalancer)
+(define-data-var global-reward-rate uint u1000)
+
+(define-map pool-rewards
+  { pool-id: uint }
+  {
+    reward-rate: uint,
+    total-staked: uint,
+    reward-per-token: uint,
+    last-update-block: uint,
+    active: bool
+  }
+)
+
+(define-map user-stakes
+  { user: principal, pool-id: uint }
+  {
+    staked-amount: uint,
+    stake-start-block: uint,
+    reward-debt: uint,
+    unclaimed-rewards: uint
+  }
+)
 
 (define-private (simple-sqrt (x uint))
   (if (<= x u1)
@@ -74,6 +99,41 @@
       (let ((lp-x (/ (* amount-x lp-supply) reserve-x))
             (lp-y (/ (* amount-y lp-supply) reserve-y)))
         (if (<= lp-x lp-y) lp-x lp-y)))
+)
+
+(define-private (calculate-reward-per-token (pool-id uint))
+  (let ((pool-reward-data (default-to 
+    { reward-rate: u0, total-staked: u0, reward-per-token: u0, last-update-block: u0, active: false }
+    (map-get? pool-rewards { pool-id: pool-id }))))
+    (if (is-eq (get total-staked pool-reward-data) u0)
+        (get reward-per-token pool-reward-data)
+        (let ((blocks-elapsed (- stacks-block-height (get last-update-block pool-reward-data)))
+              (reward-increment (/ (* (get reward-rate pool-reward-data) blocks-elapsed) (get total-staked pool-reward-data))))
+          (+ (get reward-per-token pool-reward-data) reward-increment))))
+)
+
+(define-private (calculate-user-rewards (user principal) (pool-id uint))
+  (let ((stake-data (default-to 
+    { staked-amount: u0, stake-start-block: u0, reward-debt: u0, unclaimed-rewards: u0 }
+    (map-get? user-stakes { user: user, pool-id: pool-id })))
+        (current-reward-per-token (calculate-reward-per-token pool-id)))
+    (+ (get unclaimed-rewards stake-data)
+       (* (get staked-amount stake-data) 
+          (- current-reward-per-token (get reward-debt stake-data)))))
+)
+
+(define-private (update-pool-rewards (pool-id uint))
+  (let ((current-reward-per-token (calculate-reward-per-token pool-id))
+        (pool-reward-data (default-to 
+          { reward-rate: u0, total-staked: u0, reward-per-token: u0, last-update-block: u0, active: false }
+          (map-get? pool-rewards { pool-id: pool-id }))))
+    (map-set pool-rewards 
+      { pool-id: pool-id }
+      (merge pool-reward-data {
+        reward-per-token: current-reward-per-token,
+        last-update-block: stacks-block-height
+      }))
+    true)
 )
 
 (define-private (needs-rebalancing (pool-id uint))
@@ -318,6 +378,116 @@
     (ok true))
 )
 
+(define-public (activate-pool-rewards (pool-id uint) (reward-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-some (map-get? pools { pool-id: pool-id })) ERR-POOL-NOT-EXISTS)
+    (asserts! (> reward-rate u0) ERR-INVALID-AMOUNT)
+    
+    (map-set pool-rewards
+      { pool-id: pool-id }
+      {
+        reward-rate: reward-rate,
+        total-staked: u0,
+        reward-per-token: u0,
+        last-update-block: stacks-block-height,
+        active: true
+      })
+    (ok true))
+)
+
+(define-public (stake-lp-tokens (pool-id uint) (amount uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS))
+        (user-position (unwrap! (map-get? user-positions { user: tx-sender, pool-id: pool-id }) ERR-INSUFFICIENT-LIQUIDITY))
+        (pool-reward-data (unwrap! (map-get? pool-rewards { pool-id: pool-id }) ERR-REWARDS-NOT-ACTIVE))
+        (current-stake (default-to 
+          { staked-amount: u0, stake-start-block: u0, reward-debt: u0, unclaimed-rewards: u0 }
+          (map-get? user-stakes { user: tx-sender, pool-id: pool-id }))))
+    
+    (asserts! (get active pool-reward-data) ERR-REWARDS-NOT-ACTIVE)
+    (asserts! (>= (get lp-tokens user-position) amount) ERR-INSUFFICIENT-LIQUIDITY)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    (update-pool-rewards pool-id)
+    
+    (let ((current-reward-per-token (calculate-reward-per-token pool-id))
+          (pending-rewards (calculate-user-rewards tx-sender pool-id)))
+      
+      (map-set user-stakes
+        { user: tx-sender, pool-id: pool-id }
+        {
+          staked-amount: (+ (get staked-amount current-stake) amount),
+          stake-start-block: stacks-block-height,
+          reward-debt: current-reward-per-token,
+          unclaimed-rewards: pending-rewards
+        })
+      
+      (map-set pool-rewards
+        { pool-id: pool-id }
+        (merge pool-reward-data {
+          total-staked: (+ (get total-staked pool-reward-data) amount)
+        }))
+      
+      (ok amount)))
+)
+
+(define-public (unstake-lp-tokens (pool-id uint) (amount uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS))
+        (pool-reward-data (unwrap! (map-get? pool-rewards { pool-id: pool-id }) ERR-REWARDS-NOT-ACTIVE))
+        (current-stake (unwrap! (map-get? user-stakes { user: tx-sender, pool-id: pool-id }) ERR-INSUFFICIENT-LIQUIDITY)))
+    
+    (asserts! (>= (get staked-amount current-stake) amount) ERR-INSUFFICIENT-LIQUIDITY)
+    (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+    
+    (update-pool-rewards pool-id)
+    
+    (let ((current-reward-per-token (calculate-reward-per-token pool-id))
+          (pending-rewards (calculate-user-rewards tx-sender pool-id)))
+      
+      (map-set user-stakes
+        { user: tx-sender, pool-id: pool-id }
+        {
+          staked-amount: (- (get staked-amount current-stake) amount),
+          stake-start-block: (get stake-start-block current-stake),
+          reward-debt: current-reward-per-token,
+          unclaimed-rewards: pending-rewards
+        })
+      
+      (map-set pool-rewards
+        { pool-id: pool-id }
+        (merge pool-reward-data {
+          total-staked: (- (get total-staked pool-reward-data) amount)
+        }))
+      
+      (ok amount)))
+)
+
+(define-public (claim-rewards (pool-id uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS))
+        (pool-reward-data (unwrap! (map-get? pool-rewards { pool-id: pool-id }) ERR-REWARDS-NOT-ACTIVE))
+        (current-stake (unwrap! (map-get? user-stakes { user: tx-sender, pool-id: pool-id }) ERR-INSUFFICIENT-LIQUIDITY)))
+    
+    (asserts! (get active pool-reward-data) ERR-REWARDS-NOT-ACTIVE)
+    
+    (update-pool-rewards pool-id)
+    
+    (let ((rewards-to-claim (calculate-user-rewards tx-sender pool-id))
+          (current-reward-per-token (calculate-reward-per-token pool-id)))
+      
+      (asserts! (> rewards-to-claim u0) ERR-NO-REWARDS)
+      
+      (map-set user-stakes
+        { user: tx-sender, pool-id: pool-id }
+        {
+          staked-amount: (get staked-amount current-stake),
+          stake-start-block: (get stake-start-block current-stake),
+          reward-debt: current-reward-per-token,
+          unclaimed-rewards: u0
+        })
+      
+      (ok rewards-to-claim)))
+)
+
 (define-read-only (get-pool (pool-id uint))
   (map-get? pools { pool-id: pool-id })
 )
@@ -352,4 +522,22 @@
 
 (define-read-only (check-rebalance-needed (pool-id uint))
   (needs-rebalancing pool-id)
+)
+
+(define-read-only (get-pool-rewards (pool-id uint))
+  (map-get? pool-rewards { pool-id: pool-id })
+)
+
+(define-read-only (get-user-stake (user principal) (pool-id uint))
+  (map-get? user-stakes { user: user, pool-id: pool-id })
+)
+
+(define-read-only (get-pending-rewards (user principal) (pool-id uint))
+  (ok (calculate-user-rewards user pool-id))
+)
+
+(define-read-only (get-reward-rate (pool-id uint))
+  (match (map-get? pool-rewards { pool-id: pool-id })
+    reward-data (ok (get reward-rate reward-data))
+    ERR-POOL-NOT-EXISTS)
 )
