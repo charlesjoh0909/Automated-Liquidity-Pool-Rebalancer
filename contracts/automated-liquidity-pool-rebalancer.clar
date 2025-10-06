@@ -8,11 +8,16 @@
 (define-constant ERR-ZERO-AMOUNT (err u106))
 (define-constant ERR-NO-REWARDS (err u107))
 (define-constant ERR-REWARDS-NOT-ACTIVE (err u108))
+(define-constant ERR-FLASH-LOAN-NOT-REPAID (err u109))
+(define-constant ERR-FLASH-LOAN-ACTIVE (err u110))
+(define-constant ERR-INVALID-CALLBACK (err u111))
 
 (define-data-var next-pool-id uint u0)
 (define-data-var total-pools uint u0)
 (define-data-var protocol-fee-rate uint u30)
 (define-data-var rebalance-threshold uint u500)
+(define-data-var flash-loan-fee-rate uint u9)
+(define-data-var flash-loan-in-progress bool false)
 
 (define-map pools 
   { pool-id: uint }
@@ -68,6 +73,15 @@
     stake-start-block: uint,
     reward-debt: uint,
     unclaimed-rewards: uint
+  }
+)
+
+(define-map flash-loan-state
+  { pool-id: uint }
+  {
+    borrowed-x: uint,
+    borrowed-y: uint,
+    borrower: principal
   }
 )
 
@@ -488,6 +502,84 @@
       (ok rewards-to-claim)))
 )
 
+(define-public (flash-loan (pool-id uint) (amount-x uint) (amount-y uint) (recipient principal))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS))
+        (fee-x (/ (* amount-x (var-get flash-loan-fee-rate)) u10000))
+        (fee-y (/ (* amount-y (var-get flash-loan-fee-rate)) u10000))
+        (pool-fees-data (default-to { accumulated-fees-x: u0, accumulated-fees-y: u0 } 
+                                   (map-get? pool-fees { pool-id: pool-id }))))
+    
+    (asserts! (get active pool-data) ERR-POOL-NOT-EXISTS)
+    (asserts! (not (var-get flash-loan-in-progress)) ERR-FLASH-LOAN-ACTIVE)
+    (asserts! (>= (get reserve-x pool-data) amount-x) ERR-INSUFFICIENT-LIQUIDITY)
+    (asserts! (>= (get reserve-y pool-data) amount-y) ERR-INSUFFICIENT-LIQUIDITY)
+    
+    (var-set flash-loan-in-progress true)
+    
+    (map-set flash-loan-state
+      { pool-id: pool-id }
+      {
+        borrowed-x: amount-x,
+        borrowed-y: amount-y,
+        borrower: tx-sender
+      })
+    
+    (map-set pools
+      { pool-id: pool-id }
+      (merge pool-data {
+        reserve-x: (- (get reserve-x pool-data) amount-x),
+        reserve-y: (- (get reserve-y pool-data) amount-y)
+      }))
+    
+    (ok { 
+      amount-x: amount-x, 
+      amount-y: amount-y, 
+      fee-x: fee-x, 
+      fee-y: fee-y 
+    }))
+)
+
+(define-public (repay-flash-loan (pool-id uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS))
+        (loan-state (unwrap! (map-get? flash-loan-state { pool-id: pool-id }) ERR-INVALID-CALLBACK))
+        (fee-x (/ (* (get borrowed-x loan-state) (var-get flash-loan-fee-rate)) u10000))
+        (fee-y (/ (* (get borrowed-y loan-state) (var-get flash-loan-fee-rate)) u10000))
+        (repay-amount-x (+ (get borrowed-x loan-state) fee-x))
+        (repay-amount-y (+ (get borrowed-y loan-state) fee-y))
+        (pool-fees-data (default-to { accumulated-fees-x: u0, accumulated-fees-y: u0 } 
+                                   (map-get? pool-fees { pool-id: pool-id }))))
+    
+    (asserts! (var-get flash-loan-in-progress) ERR-INVALID-CALLBACK)
+    (asserts! (is-eq (get borrower loan-state) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (map-set pools
+      { pool-id: pool-id }
+      (merge pool-data {
+        reserve-x: (+ (get reserve-x pool-data) repay-amount-x),
+        reserve-y: (+ (get reserve-y pool-data) repay-amount-y)
+      }))
+    
+    (map-set pool-fees
+      { pool-id: pool-id }
+      (merge pool-fees-data {
+        accumulated-fees-x: (+ (get accumulated-fees-x pool-fees-data) fee-x),
+        accumulated-fees-y: (+ (get accumulated-fees-y pool-fees-data) fee-y)
+      }))
+    
+    (map-delete flash-loan-state { pool-id: pool-id })
+    (var-set flash-loan-in-progress false)
+    
+    (ok true))
+)
+
+(define-public (set-flash-loan-fee (new-fee-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-fee-rate u100) ERR-INVALID-AMOUNT)
+    (var-set flash-loan-fee-rate new-fee-rate)
+    (ok true))
+)
+
 (define-read-only (get-pool (pool-id uint))
   (map-get? pools { pool-id: pool-id })
 )
@@ -540,4 +632,20 @@
   (match (map-get? pool-rewards { pool-id: pool-id })
     reward-data (ok (get reward-rate reward-data))
     ERR-POOL-NOT-EXISTS)
+)
+
+(define-read-only (get-flash-loan-fee-rate)
+  (var-get flash-loan-fee-rate)
+)
+
+(define-read-only (get-flash-loan-state (pool-id uint))
+  (map-get? flash-loan-state { pool-id: pool-id })
+)
+
+(define-read-only (is-flash-loan-in-progress)
+  (var-get flash-loan-in-progress)
+)
+
+(define-read-only (calculate-flash-loan-fee (amount uint))
+  (/ (* amount (var-get flash-loan-fee-rate)) u10000)
 )
