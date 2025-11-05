@@ -392,6 +392,20 @@
     (ok true))
 )
 
+(define-public (deactivate-pool (pool-id uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (map-set pools { pool-id: pool-id } (merge pool-data { active: false }))
+    (ok true))
+)
+
+(define-public (reactivate-pool (pool-id uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (map-set pools { pool-id: pool-id } (merge pool-data { active: true }))
+    (ok true))
+)
+
 (define-public (activate-pool-rewards (pool-id uint) (reward-rate uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
