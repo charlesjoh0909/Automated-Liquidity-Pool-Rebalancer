@@ -392,6 +392,13 @@
     (ok true))
 )
 
+(define-public (set-pool-fee-rate (pool-id uint) (new-rate uint))
+  (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS)))
+    (asserts! (or (is-eq tx-sender CONTRACT-OWNER) (is-eq tx-sender (get created-by pool-data))) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-rate u100) ERR-INVALID-AMOUNT)
+    (map-set pools { pool-id: pool-id } (merge pool-data { fee-rate: new-rate }))
+    (ok true)))
+
 (define-public (deactivate-pool (pool-id uint))
   (let ((pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR-POOL-NOT-EXISTS)))
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
