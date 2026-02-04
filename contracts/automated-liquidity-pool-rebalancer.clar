@@ -670,3 +670,49 @@
 (define-read-only (calculate-flash-loan-fee (amount uint))
   (/ (* amount (var-get flash-loan-fee-rate)) u10000)
 )
+
+(define-read-only (get-rebalance-preview (pool-id uint))
+  (match (map-get? pools { pool-id: pool-id })
+    pool-data
+    (let ((current-price (calculate-price (get reserve-x pool-data) (get reserve-y pool-data)))
+          (target-price (get target-ratio pool-data))
+          (needs (needs-rebalancing pool-id)))
+      (if needs
+          (if (> current-price target-price)
+              (let ((excess-x (/ (* (get reserve-x pool-data) (- current-price target-price)) (* u2 current-price)))
+                    (amount-y-out (get-amount-out excess-x (get reserve-x pool-data) (get reserve-y pool-data) u0))
+                    (new-x (- (get reserve-x pool-data) excess-x))
+                    (new-y (+ (get reserve-y pool-data) amount-y-out)))
+                (ok {
+                  needs: true,
+                  direction-x-to-y: true,
+                  amount-in: excess-x,
+                  amount-out: amount-y-out,
+                  new-reserve-x: new-x,
+                  new-reserve-y: new-y,
+                  result-price: target-price
+                }))
+              (let ((excess-y (/ (* (get reserve-y pool-data) (- target-price current-price)) (* u2 target-price)))
+                    (amount-x-out (get-amount-out excess-y (get reserve-y pool-data) (get reserve-x pool-data) u0))
+                    (new-x (+ (get reserve-x pool-data) amount-x-out))
+                    (new-y (- (get reserve-y pool-data) excess-y)))
+                (ok {
+                  needs: true,
+                  direction-x-to-y: false,
+                  amount-in: excess-y,
+                  amount-out: amount-x-out,
+                  new-reserve-x: new-x,
+                  new-reserve-y: new-y,
+                  result-price: target-price
+                })))
+          (ok {
+            needs: false,
+            direction-x-to-y: false,
+            amount-in: u0,
+            amount-out: u0,
+            new-reserve-x: (get reserve-x pool-data),
+            new-reserve-y: (get reserve-y pool-data),
+            result-price: current-price
+          })))
+    ERR-POOL-NOT-EXISTS)
+)
